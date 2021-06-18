@@ -11,6 +11,7 @@ import gzip
 import shutil
 import urllib3
 import argparse
+from datetime import datetime
 
 
 def get_args():
@@ -33,6 +34,10 @@ def get_args():
                         help="Enable checking of the Errata database, expect longer time for output processing.")
     parser.add_argument("--get-replica-holdings", dest="get_holdings", default=False, action="store_true",
                         help="Enable output of replica holdings for comparison with SQLite database paths.")
+    parser.add_argument("--cert", dest="cert", default="/p/user_pub/publish-queue/certs/certificate-file",
+                        help="Override default certificate, please use absolute path.")
+    parser.add_argument("--debug", dest="debug", default=False, action="store_true",
+                        help="Enable debug testing mode, caps retrievable records (output is not complete, but sufficient for thorough testing).")
 
     return parser.parse_args()
 
@@ -59,8 +64,10 @@ AC_ERR = "Failed activity check:"
 EC_ERR = "Failed experiment_id check:"
 ERRATA = "Errata found:"
 duplicates = []
+metrics = {}
 INDEX_NODE = "esgf-node.llnl.gov"
-CERT = "/p/user_pub/publish-queue/certs/certificate-file"
+CERT = args.cert
+DEBUG = args.debug
 CMOR_PATH = args.cmor_tables
 DIRECTORY = args.output_directory
 if SAVE_REPLICA_HOLDINGS:
@@ -107,8 +114,10 @@ def compare(r, original, attr):  # use to compare attributes, r is response and 
         return False
 
 
-def get_list(node="default"):
-    if node == "default":
+def get_list(node="default", shard=False):
+    if shard:
+        url = "http://esgf-node.llnl.gov/esg-search/search?shards={}/solr&project=CMIP6&limit=0&facets=institution_id&replica=false&format=application%2fsolr%2bjson&latest=true".format(node)
+    elif node == "default":
         url = "https://esgf-node.llnl.gov/esg-search/search?facets=institution_id&project=CMIP6&format=application%2fsolr%2bjson"
     elif node == "esgf-node.ipsl.upmc.fr":
         url = "https://esgf-node.ipsl.upmc.fr/esg-search/search?project=CMIP6&limit=0&facets=institution_id&distrib=false&replica=false&latest=true&format=application%2fsolr%2bjson"
@@ -127,7 +136,8 @@ def get_list(node="default"):
     else:
         print("ERROR: Invalid node.")
         exit(1)
-
+    if DEBUG:
+        print(url)
     resp = json.loads(requests.get(url).text)
     lst = []
     i = 0
@@ -152,6 +162,7 @@ def get_nodes():
 
     lst = []
     bad_lst = []
+    global FIX_ERRS
 
     for x in a:
         print(x)
@@ -170,15 +181,38 @@ def get_nodes():
         if not unreachable:
             lst.append(x)
 
+    if skipped > 0:
+        FIX_ERRS = False
     if skipped > 2:
         print("ERROR: more than 2 data nodes unreachable. Exiting.")
         exit(1)
     else:
         warnings.append("WARNING: following data nodes unreachable: " + str(bad_lst) + ". This may impact results.")
-        return lst
+        return lst, bad_lst
 
 
-def get_batch(search_url, institution):
+def shard_test(bad_lst):
+    retries = requests.packages.urllib3.util.retry.Retry(total=3, backoff_factor=2,
+                                                         status_forcelist=[429, 500, 502, 503, 504])
+    adapter = requests.adapters.HTTPAdapter(max_retries=retries)
+    http = requests.Session()
+    http.mount("http://", adapter)
+    nr_shards = []
+    temp = "http://esgf-node.llnl.gov/esg-search/search?shards={}/solr&limit=100&format=application%2fsolr%2bjson"
+    for n in bad_lst:
+        url = temp.format(n)
+        try:
+            r = json.loads(http.get(url, timeout=120).text)
+            if r["response"]["numFound"] <= 0:
+                nr_shards.append(n)
+        except:
+            nr_shards.append(n)
+            print("Shard for " + n + " unreachable.")
+
+    return nr_shards
+
+
+def get_batch(search_url, institution, node=None):
     if TEST:
         return {}, 0
     going = True
@@ -199,14 +233,20 @@ def get_batch(search_url, institution):
 
         found = 0
         try:  # put in a timeout for buffering instances
-            print(".", end="", flush=True)
+            if DEBUG:
+                print(search_url.format(NUM_RETR, offset, institution), end="\n", flush=True)
             resp = json.loads(http.get(search_url.format(NUM_RETR, offset, institution), timeout=60).text)
         except Exception as x:
             print("Error with load. Loaded " + str(count * NUM_RETR) + " results from " + institution)
-            warning = "WARNING: Error with loading results from " + institution + ": " + str(
-                seen) + " results loaded. May impact error checking."
-            warnings.append(warning)
-            skips.append(institution)
+            if node and node not in nr_node_list:
+                warnings.append("INFO: using data shard for " + node + ". This may impact results.")
+                nr_node_list.append(node)
+                all_nodes.append(node)
+            elif not node or 'shard' in search_url:
+                warning = "WARNING: Error with loading results from " + institution + ": " + str(
+                    seen) + " results loaded. May impact error checking."
+                warnings.append(warning)
+                skips.append(institution)
             break
 
         numfound = resp["response"]["numFound"]
@@ -214,8 +254,13 @@ def get_batch(search_url, institution):
         # check if numfound = len response docs, does numfound remain consistent
         if numfound == 0:
             print("ERROR: No results loaded from " + institution + ". Possible network error: " + search_url)
-            warning = "ERROR: No results loaded from " + institution + ". Possible network error: " + search_url
-            warnings.append(warning)
+            if node and node not in nr_node_list:
+                warnings.append("INFO: using data shard for " + node + ". This may impact results.")
+                nr_node_list.append(node)
+                all_nodes.append(node)
+            elif not node or 'shard' in search_url:
+                warning = "ERROR: No results loaded from " + institution + ". Possible network error: " + search_url
+                warnings.append(warning)
             return {}, -1
 
         if togo == 0:
@@ -255,18 +300,30 @@ def get_batch(search_url, institution):
                     batch[n["instance_id"]].append(n)
             seen += 1
         count += 1
-        """if count >= 1:  # use to decide how many records to retrieve (testing tool)
-            if going:
-                going = False
-                print("Loaded 10k (temp max) results from " + institution)"""
-    print("Done.")
-    if found == 0:
-        print("Error with load, " + str(found) + " found.")
-    elif seen < found:
+        if DEBUG:
+            if count >= 1:  # use to decide how many records to retrieve (testing tool)
+                if going:
+                    going = False
+                    print("Loaded 10k (temp max) results from " + institution)
+    if seen == 0:
+        if node and node not in nr_node_list:
+            warnings.append("INFO: using data shard for " + node + ". This may impact results.")
+            nr_node_list.append(node)
+            all_nodes.append(node)
+    elif seen < found and not DEBUG:
         print("Error. Only " + str(seen) + " results loaded out of " + str(found) + ".")
         warning = "ERROR collecting results from " + institution + ": Only " + str(
             seen) + " results loaded out of " + str(found) + "."
         warnings.append(warning)
+    if institution not in metrics:
+        metrics[institution] = {}
+        metrics[institution]["numfound"] = found
+        metrics[institution]["actual"] = seen
+    else:
+        metrics[institution]["numfound"] += found
+        metrics[institution]["actual"] += seen
+    print("Done.")
+
     return batch, found
 
 
@@ -274,6 +331,11 @@ def flag(field, err, group):
     if field not in inconsistencies[err].keys():
         inconsistencies[err][field] = []
     inconsistencies[err][field].append(group)
+
+
+def log_metrics(fn):
+    with open(fn, "w") as mf:
+        json.dump(metrics, mf, indent=4)
 
 
 def count_error(err, field):
@@ -533,9 +595,10 @@ def gen_ids(d):
     rm = []
     lf = []
     nodes = ["aims3.llnl.gov", "esgf-data1.llnl.gov"]
-    print(d.keys())
     for err in d.keys():
-        if err == ORIGINAL_ERR or err == RETRACT_ERR:
+        # if err == ORIGINAL_ERR or err == RETRACT_ERR:
+        # temporarily removed this ^ due to false positives being retracted when nodes are down
+        if err == RETRACT_ERR:
             l = rm
         elif err == LATEST_ERR:
             l = lf
@@ -604,13 +667,22 @@ if __name__ == '__main__':
     # retracted=false
     # look at IPSL for latest false originals
     search_url = "http://esgf-node.llnl.gov/esg-search/search?project=CMIP6&latest=true&retracted=false&limit={}&offset={}&format=application%2fsolr%2bjson&replica=true&institution_id={}&fields=instance_id,number_of_files,_timestamp,data_node,replica,institution_id,latest,retracted,id,activity_drs,activity_id,source_id,experiment_id"
+    shard_url = "http://esgf-node.llnl.gov/esg-search/search?shards={}/solr&"
+    shard_args = "project=CMIP6&latest=true&retracted=false&limit={}&offset={}&format=application%2fsolr%2bjson&institution_id={}&replica=False&fields=instance_id,number_of_files,_timestamp,data_node,replica,institution_id,latest,retracted,id,activity_drs,activity_id,source_id,experiment_id"
     
-    node_list = get_nodes()
-    
-    uk_args = "project=CMIP6&limit={}&offset={}&institution_id={}&replica=false&fields=instance_id,number_of_files,_timestamp,data_node,replica,institution_id,latest,version,retracted,id,activity_drs,activity_id,source_id,experiment_id"
+    node_list, nr_node_list = get_nodes()
+    all_nodes = node_list + nr_node_list
+    bad_shards = shard_test(nr_node_list)
 
-    for node in node_list:
+    uk_args = "limit={}&offset={}&institution_id={}&replica=false&format=application%2fsolr%2bjson&fields=instance_id,number_of_files,_timestamp,data_node,replica,institution_id,latest,version,retracted,id,activity_drs,activity_id,source_id,experiment_id"
+
+    for node in all_nodes:
         print(node)
+        bad_node = node in nr_node_list
+        if bad_node and node in bad_shards:
+            continue
+        if bad_node:
+            institution_list = get_list(node, shard=True)
         try:
             institution_list = get_list(node)
         except Exception as ex:
@@ -621,13 +693,16 @@ if __name__ == '__main__':
                 continue
             else:
                 base = "http://{}/esg-search/search?".format(node)
+                if bad_node:
+                    base = shard_url.format(node)
+                    args = shard_args
                 if "ceda" in node:
                     args = uk_args
                 else:
                     args = "project=CMIP6&limit={}&offset={}&format=application%2fsolr%2bjson&institution_id={}&replica=false&fields=instance_id,number_of_files,_timestamp,data_node,replica,institution_id,latest,version,retracted,id,activity_drs,activity_id,source_id,experiment_id"
                 url = base + args
             print("Fetching originals...")
-            originals, tally = get_batch(url, institution)
+            originals, tally = get_batch(url, institution, node)
             if tally == 0:
                 continue
             else:
@@ -656,6 +731,7 @@ if __name__ == '__main__':
             continue
         if institution not in originals_by_institution.keys():
             print("No original records found for: " + institution)
+            warnings.append("No original records found for: " + institution)
             continue
         print("Fetching replicas...")
         replicas, tally = get_batch(search_url, institution)
@@ -715,6 +791,10 @@ if __name__ == '__main__':
     zipfile.close()
     if SAVE_REPLICA_HOLDINGS:
         instance_file.close()
+
+    now = datetime.now()
+    metric_fn = DIRECTORY + "metrics." + str(now.strftime("%Y%m%d")) + ".json"
+    log_metrics(metric_fn)
     # with open(DIRECTORY + 'E3SM.json', 'w+') as d:
     #    json.dump(E3SM_f, d, indent=4)
 
@@ -728,7 +808,7 @@ if __name__ == '__main__':
     if len(warnings) > 2:
         pass
     elif EMAIL_LIST:
-        send_data(summ, 'ruth.petrie@stfc.ac.uk')
+        send_data(summ, 'alan.iwi@stfc.ac.uk')
         send_data(summ, 'esgf@dkrz.de')
         send_data(summ, 'kelsey.druken@anu.edu.au')
 
